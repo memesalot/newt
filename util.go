@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -102,6 +103,81 @@ func ping(tnet *netstack.Net, dst string, timeout time.Duration) (time.Duration,
 	return latency, nil
 }
 
+// isNetworkConnected checks if network connectivity is available to the destination
+func isNetworkConnected(dst string) bool {
+	// For IP addresses, skip DNS resolution
+	if net.ParseIP(dst) == nil {
+		// Try to resolve the hostname first with a short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		resolver := &net.Resolver{}
+		_, err := resolver.LookupHost(ctx, dst)
+		if err != nil {
+			logger.Debug("DNS resolution failed for %s: %v", dst, err)
+			return false
+		}
+	}
+
+	// Check if we have basic internet connectivity by trying common public DNS
+	testConn, err := net.DialTimeout("udp", "8.8.8.8:53", 2*time.Second)
+	if err != nil {
+		logger.Debug("No basic internet connectivity")
+		return false
+	}
+	testConn.Close()
+
+	// Check if we have a route to the specific destination
+	dstIP := net.ParseIP(dst)
+	if dstIP == nil {
+		// If dst is not an IP, try to resolve it
+		addrs, err := net.LookupIP(dst)
+		if err != nil || len(addrs) == 0 {
+			logger.Debug("Could not resolve %s to IP address", dst)
+			return false
+		}
+		dstIP = addrs[0]
+	}
+
+	// Try to create a connection to check routing (doesn't actually connect)
+	// Use a more aggressive timeout since we're just checking connectivity
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(dstIP.String(), "443"), 1*time.Second)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+
+	// If TCP fails, try UDP as a fallback
+	conn, err = net.DialTimeout("udp", net.JoinHostPort(dstIP.String(), "53"), 1*time.Second)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+
+	logger.Debug("No network connectivity to %s", dst)
+	return false
+}
+
+// isTunnelError checks if an error indicates tunnel failure requiring reconnection
+func isTunnelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "network is unreachable") ||
+		strings.Contains(errStr, "no route to host") ||
+		strings.Contains(errStr, "connection refused")
+}
+
+// isTimeoutError checks if an error is an i/o timeout
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "i/o timeout")
+}
+
 // reliablePing performs multiple ping attempts with adaptive timeout
 func reliablePing(tnet *netstack.Net, dst string, baseTimeout time.Duration, maxAttempts int) (time.Duration, error) {
 	var lastErr error
@@ -160,6 +236,7 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 		initialMaxAttempts = 5
 		initialRetryDelay  = 2 * time.Second
 		maxRetryDelay      = 60 * time.Second // Cap the maximum delay
+		networkCheckDelay  = 5 * time.Second  // Check network availability every 5s when failing
 	)
 
 	stopChan = make(chan struct{})
@@ -186,19 +263,54 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 	// Start a goroutine that will attempt pings indefinitely with increasing delays
 	go func() {
 		attempt = 2 // Continue from attempt 2
+		consecutiveFailures := 0
+		consecutiveTimeouts := 0
 
 		for {
 			select {
 			case <-stopChan:
 				return
 			default:
+				// Check network connectivity before attempting ping
+				if !isNetworkConnected(dst) {
+					logger.Debug("Network connectivity not available, waiting %v before retry", networkCheckDelay)
+					time.Sleep(networkCheckDelay)
+					continue
+				}
+
 				logger.Debug("Ping attempt %d", attempt)
 
 				if latency, err := ping(tnet, dst, timeout); err != nil {
+					consecutiveFailures++
 					logger.Warn("Ping attempt %d failed: %v", attempt, err)
 
-					// Increase delay after certain thresholds but cap it
-					if attempt%5 == 0 && retryDelay < maxRetryDelay {
+					// Check if this is a tunnel failure requiring reconnection
+					if isTunnelError(err) {
+						logger.Error("Tunnel failure detected: %v", err)
+						logger.Info("Tunnel failure detected - stopping retry attempts")
+						return // Exit retry loop as tunnel needs to be recreated
+					}
+
+					// Track timeout errors specifically
+					if isTimeoutError(err) {
+						consecutiveTimeouts++
+						// If we get 8+ consecutive timeouts, the tunnel is likely stuck
+						if consecutiveTimeouts >= 8 {
+							logger.Error("Too many consecutive timeout errors (%d), tunnel likely stuck", consecutiveTimeouts)
+							logger.Info("Too many timeouts detected - stopping retry attempts")
+							return // Exit retry loop as tunnel needs to be recreated
+						}
+					} else {
+						consecutiveTimeouts = 0 // Reset timeout counter for non-timeout errors
+					}
+
+					// Reset retry delay if we've been failing for too long (potential network change)
+					if consecutiveFailures > 20 {
+						logger.Info("Resetting retry delay due to extended failures (potential network change)")
+						retryDelay = initialRetryDelay
+						consecutiveFailures = 0
+					} else if attempt%5 == 0 && retryDelay < maxRetryDelay {
+						// Increase delay after certain thresholds but cap it
 						retryDelay = time.Duration(float64(retryDelay) * 1.5)
 						if retryDelay > maxRetryDelay {
 							retryDelay = maxRetryDelay
@@ -209,7 +321,10 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 					time.Sleep(retryDelay)
 					attempt++
 				} else {
-					// Successful ping
+					// Successful ping - reset counters
+					consecutiveFailures = 0
+					consecutiveTimeouts = 0
+					retryDelay = initialRetryDelay
 					logger.Debug("Ping succeeded after %d attempts", attempt)
 					logger.Debug("Ping latency: %v", latency)
 					logger.Info("Tunnel connection to server established successfully!")
@@ -233,6 +348,7 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 	maxInterval := 6 * time.Second
 	currentInterval := pingInterval
 	consecutiveFailures := 0
+	consecutiveTimeouts := 0
 	connectionLost := false
 
 	// Track recent latencies for adaptive timeout calculation
@@ -270,9 +386,85 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 					maxAttempts = 4 // More attempts when connection is unstable
 				}
 
+				// Check network connectivity before attempting ping
+				if !isNetworkConnected(serverIP) {
+					logger.Debug("Network connectivity not available for ping check")
+					consecutiveFailures++
+					// Don't spam logs when network is down
+					if consecutiveFailures <= 5 {
+						logger.Warn("Network connectivity lost (%d consecutive failures)", consecutiveFailures)
+					}
+
+					// Trigger recovery mechanism faster when network is down
+					if consecutiveFailures >= 2 && !connectionLost {
+						connectionLost = true
+						logger.Warn("Network connectivity lost. Starting WebSocket ping requests.")
+						stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
+
+						if healthFile != "" {
+							err := os.Remove(healthFile)
+							if err != nil {
+								logger.Error("Failed to remove health file: %v", err)
+							}
+						}
+					}
+
+					// Use shorter intervals when network is down to detect recovery faster
+					currentInterval = 5 * time.Second
+					ticker.Reset(currentInterval)
+					return // Skip ping attempt
+				}
+
 				latency, err := reliablePing(tnet, serverIP, adaptiveTimeout, maxAttempts)
 				if err != nil {
 					consecutiveFailures++
+
+					// Check if this is a tunnel failure requiring immediate reconnection
+					if isTunnelError(err) {
+						logger.Error("Tunnel failure detected in ping check: %v", err)
+						logger.Info("Requesting tunnel reconnection due to tunnel failure")
+						if !connectionLost {
+							connectionLost = true
+							// Send registration request immediately for tunnel failures
+							if stopFunc != nil {
+								stopFunc()
+							}
+							stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
+							if healthFile != "" {
+								err := os.Remove(healthFile)
+								if err != nil {
+									logger.Error("Failed to remove health file: %v", err)
+								}
+							}
+						}
+						return // Exit ping check as tunnel needs to be recreated
+					}
+
+					// Track timeout errors specifically
+					if isTimeoutError(err) {
+						consecutiveTimeouts++
+						// If we get 6+ consecutive timeouts in ping check, tunnel is likely stuck
+						if consecutiveTimeouts >= 6 {
+							logger.Error("Too many consecutive timeout errors in ping check (%d), tunnel likely stuck", consecutiveTimeouts)
+							logger.Info("Requesting tunnel reconnection due to persistent timeouts")
+							if !connectionLost {
+								connectionLost = true
+								if stopFunc != nil {
+									stopFunc()
+								}
+								stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
+								if healthFile != "" {
+									err := os.Remove(healthFile)
+									if err != nil {
+										logger.Error("Failed to remove health file: %v", err)
+									}
+								}
+							}
+							return // Exit ping check as tunnel needs to be recreated
+						}
+					} else {
+						consecutiveTimeouts = 0 // Reset timeout counter for non-timeout errors
+					}
 
 					// Track recent latencies (add a high value for failures)
 					recentLatencies = append(recentLatencies, adaptiveTimeout)
@@ -325,6 +517,14 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 					if connectionLost {
 						connectionLost = false
 						logger.Info("Connection to server restored after %d failures!", consecutiveFailures)
+
+						// Stop WebSocket ping requests when ICMP ping is working again
+						if stopFunc != nil {
+							logger.Debug("Stopping WebSocket ping requests - ICMP ping restored")
+							stopFunc()
+							stopFunc = nil
+						}
+
 						if healthFile != "" {
 							err := os.WriteFile(healthFile, []byte("ok"), 0644)
 							if err != nil {
@@ -341,6 +541,7 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 						logger.Debug("Decreased ping check interval to %v after successful ping", currentInterval)
 					}
 					consecutiveFailures = 0
+					consecutiveTimeouts = 0
 				}
 			case <-pingStopChan:
 				logger.Info("Stopping ping check")
