@@ -1,6 +1,7 @@
 package wgnetstack
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -26,6 +27,8 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/fosrl/newt/internal/telemetry"
 )
 
 type WgConfig struct {
@@ -187,6 +190,13 @@ func NewWireGuardService(interfaceName string, mtu int, generateAndSaveKeyTo str
 	// Load or generate private key
 	if generateAndSaveKeyTo != "" {
 		if _, err := os.Stat(generateAndSaveKeyTo); os.IsNotExist(err) {
+			// File doesn't exist, save the generated key
+			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0600)
+			if err != nil {
+				return nil, fmt.Errorf("failed to save private key: %v", err)
+			}
+		} else {
+			// File exists, read the existing key
 			keyData, err := os.ReadFile(generateAndSaveKeyTo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read private key: %v", err)
@@ -194,11 +204,6 @@ func NewWireGuardService(interfaceName string, mtu int, generateAndSaveKeyTo str
 			key, err = wgtypes.ParseKey(strings.TrimSpace(string(keyData)))
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse private key: %v", err)
-			}
-		} else {
-			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0600)
-			if err != nil {
-				return nil, fmt.Errorf("failed to save private key: %v", err)
 			}
 		}
 	}
@@ -240,14 +245,20 @@ func NewWireGuardService(interfaceName string, mtu int, generateAndSaveKeyTo str
 	return service, nil
 }
 
+// ReportRTT allows reporting native RTTs to telemetry, rate-limited externally.
+func (s *WireGuardService) ReportRTT(seconds float64) {
+	if s.serverPubKey == "" { return }
+	telemetry.ObserveTunnelLatency(context.Background(), s.serverPubKey, "wireguard", seconds)
+}
+
 func (s *WireGuardService) addTcpTarget(msg websocket.WSMessage) {
 	logger.Debug("Received: %+v", msg)
 
 	// if there is no wgData or pm, we can't add targets
 	if s.TunnelIP == "" || s.proxyManager == nil {
 		logger.Info("No tunnel IP or proxy manager available")
-		return
-	}
+	return
+}
 
 	targetData, err := parseTargetData(msg.Data)
 	if err != nil {
@@ -1074,10 +1085,16 @@ func (s *WireGuardService) keepSendingUDPHolePunch(host string) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
+	timeout := time.NewTimer(15 * time.Second)
+	defer timeout.Stop()
+
 	for {
 		select {
 		case <-s.stopHolepunch:
 			logger.Info("Stopping UDP holepunch")
+			return
+		case <-timeout.C:
+			logger.Info("UDP holepunch routine timed out after 15 seconds")
 			return
 		case <-ticker.C:
 			if err := s.sendUDPHolePunch(host + ":21820"); err != nil {

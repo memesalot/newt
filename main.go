@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -22,6 +24,9 @@ import (
 	"github.com/fosrl/newt/updates"
 	"github.com/fosrl/newt/websocket"
 
+	"github.com/fosrl/newt/internal/state"
+	"github.com/fosrl/newt/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
@@ -74,6 +79,11 @@ type ExitNodePingResult struct {
 	WasPreviouslyConnected bool    `json:"wasPreviouslyConnected"`
 }
 
+type BlueprintResult struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+}
+
 // Custom flag type for multiple CA files
 type stringSlice []string
 
@@ -85,6 +95,14 @@ func (s *stringSlice) Set(value string) error {
 	*s = append(*s, value)
 	return nil
 }
+
+const (
+	fmtErrMarshaling        = "Error marshaling data: %v"
+	fmtReceivedMsg          = "Received: %+v"
+	topicWGRegister         = "newt/wg/register"
+	msgNoTunnelOrProxy      = "No tunnel IP or proxy manager available"
+	fmtErrParsingTargetData = "Error parsing target data: %v"
+)
 
 var (
 	endpoint                           string
@@ -115,6 +133,17 @@ var (
 	preferEndpoint                     string
 	healthMonitor                      *healthcheck.Monitor
 	enforceHealthcheckCert             bool
+	// Build/version (can be overridden via -ldflags "-X main.newtVersion=...")
+	newtVersion = "version_replaceme"
+
+	// Observability/metrics flags
+	metricsEnabled    bool
+	otlpEnabled       bool
+	adminAddr         string
+	region            string
+	metricsAsyncBytes bool
+	blueprintFile     string
+	noCloud           bool
 
 	// New mTLS configuration variables
 	tlsClientCert string
@@ -126,6 +155,10 @@ var (
 )
 
 func main() {
+	// Prepare context for graceful shutdown and signal handling
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// if PANGOLIN_ENDPOINT, NEWT_ID, and NEWT_SECRET are set as environment variables, they will be used as default values
 	endpoint = os.Getenv("PANGOLIN_ENDPOINT")
 	id = os.Getenv("NEWT_ID")
@@ -136,16 +169,22 @@ func main() {
 	updownScript = os.Getenv("UPDOWN_SCRIPT")
 	interfaceName = os.Getenv("INTERFACE")
 	generateAndSaveKeyTo = os.Getenv("GENERATE_AND_SAVE_KEY_TO")
+
+	// Metrics/observability env mirrors
+	metricsEnabledEnv := os.Getenv("NEWT_METRICS_PROMETHEUS_ENABLED")
+	otlpEnabledEnv := os.Getenv("NEWT_METRICS_OTLP_ENABLED")
+	adminAddrEnv := os.Getenv("NEWT_ADMIN_ADDR")
+	regionEnv := os.Getenv("NEWT_REGION")
+	asyncBytesEnv := os.Getenv("NEWT_METRICS_ASYNC_BYTES")
+
 	keepInterfaceEnv := os.Getenv("KEEP_INTERFACE")
-	acceptClientsEnv := os.Getenv("ACCEPT_CLIENTS")
-	useNativeInterfaceEnv := os.Getenv("USE_NATIVE_INTERFACE")
-	enforceHealthcheckCertEnv := os.Getenv("ENFORCE_HC_CERT")
-
 	keepInterface = keepInterfaceEnv == "true"
+	acceptClientsEnv := os.Getenv("ACCEPT_CLIENTS")
 	acceptClients = acceptClientsEnv == "true"
+	useNativeInterfaceEnv := os.Getenv("USE_NATIVE_INTERFACE")
 	useNativeInterface = useNativeInterfaceEnv == "true"
+	enforceHealthcheckCertEnv := os.Getenv("ENFORCE_HC_CERT")
 	enforceHealthcheckCert = enforceHealthcheckCertEnv == "true"
-
 	dockerSocket = os.Getenv("DOCKER_SOCKET")
 	pingIntervalStr := os.Getenv("PING_INTERVAL")
 	pingTimeoutStr := os.Getenv("PING_TIMEOUT")
@@ -169,9 +208,12 @@ func main() {
 	// Legacy PKCS12 support (deprecated)
 	tlsPrivateKey = os.Getenv("TLS_CLIENT_CERT_PKCS12")
 	// Keep backward compatibility with old environment variable name
-	if tlsPrivateKey == "" {
+	if tlsPrivateKey == "" && tlsClientKey == "" && len(tlsClientCAs) == 0 {
 		tlsPrivateKey = os.Getenv("TLS_CLIENT_CERT")
 	}
+	blueprintFile = os.Getenv("BLUEPRINT_FILE")
+	noCloudEnv := os.Getenv("NO_CLOUD")
+	noCloud = noCloudEnv == "true"
 
 	if endpoint == "" {
 		flag.StringVar(&endpoint, "endpoint", "", "Endpoint of your pangolin server")
@@ -271,6 +313,49 @@ func main() {
 	if healthFile == "" {
 		flag.StringVar(&healthFile, "health-file", "", "Path to health file (if unset, health file won't be written)")
 	}
+	if blueprintFile == "" {
+		flag.StringVar(&blueprintFile, "blueprint-file", "", "Path to blueprint file (if unset, no blueprint will be applied)")
+	}
+	if noCloudEnv == "" {
+		flag.BoolVar(&noCloud, "no-cloud", false, "Disable cloud failover")
+	}
+
+	// Metrics/observability flags (mirror ENV if unset)
+	if metricsEnabledEnv == "" {
+		flag.BoolVar(&metricsEnabled, "metrics", true, "Enable Prometheus /metrics exporter")
+	} else {
+		if v, err := strconv.ParseBool(metricsEnabledEnv); err == nil {
+			metricsEnabled = v
+		} else {
+			metricsEnabled = true
+		}
+	}
+	if otlpEnabledEnv == "" {
+		flag.BoolVar(&otlpEnabled, "otlp", false, "Enable OTLP exporters (metrics/traces) to OTEL_EXPORTER_OTLP_ENDPOINT")
+	} else {
+		if v, err := strconv.ParseBool(otlpEnabledEnv); err == nil {
+			otlpEnabled = v
+		}
+	}
+	if adminAddrEnv == "" {
+		flag.StringVar(&adminAddr, "metrics-admin-addr", "127.0.0.1:2112", "Admin/metrics bind address")
+	} else {
+		adminAddr = adminAddrEnv
+	}
+	// Async bytes toggle
+	if asyncBytesEnv == "" {
+		flag.BoolVar(&metricsAsyncBytes, "metrics-async-bytes", false, "Enable async bytes counting (background flush; lower hot path overhead)")
+	} else {
+		if v, err := strconv.ParseBool(asyncBytesEnv); err == nil {
+			metricsAsyncBytes = v
+		}
+	}
+	// Optional region flag (resource attribute)
+	if regionEnv == "" {
+		flag.StringVar(&region, "region", "", "Optional region resource attribute (also NEWT_REGION)")
+	} else {
+		region = regionEnv
+	}
 
 	// do a --version check
 	version := flag.Bool("version", false, "Print the version")
@@ -286,12 +371,58 @@ func main() {
 	loggerLevel := parseLogLevel(logLevel)
 	logger.GetLogger().SetLevel(parseLogLevel(logLevel))
 
-	newtVersion := "version_replaceme"
+	// Initialize telemetry after flags are parsed (so flags override env)
+	tcfg := telemetry.FromEnv()
+	tcfg.PromEnabled = metricsEnabled
+	tcfg.OTLPEnabled = otlpEnabled
+	if adminAddr != "" {
+		tcfg.AdminAddr = adminAddr
+	}
+	// Resource attributes (if available)
+	tcfg.SiteID = id
+	tcfg.Region = region
+	// Build info
+	tcfg.BuildVersion = newtVersion
+	tcfg.BuildCommit = os.Getenv("NEWT_COMMIT")
+
+	tel, telErr := telemetry.Init(ctx, tcfg)
+	if telErr != nil {
+		logger.Warn("Telemetry init failed: %v", telErr)
+	}
+	if tel != nil {
+		// Admin HTTP server (exposes /metrics when Prometheus exporter is enabled)
+		logger.Info("Starting metrics server on %s", tcfg.AdminAddr)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+		if tel.PrometheusHandler != nil {
+			mux.Handle("/metrics", tel.PrometheusHandler)
+		}
+		admin := &http.Server{
+			Addr:              tcfg.AdminAddr,
+			Handler:           otelhttp.NewHandler(mux, "newt-admin"),
+			ReadTimeout:       5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       30 * time.Second,
+		}
+		go func() {
+			if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warn("admin http error: %v", err)
+			}
+		}()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = admin.Shutdown(ctx)
+		}()
+		defer func() { _ = tel.Shutdown(context.Background()) }()
+	}
+
 	if *version {
 		fmt.Println("Newt version " + newtVersion)
 		os.Exit(0)
 	} else {
-		logger.Info("Newt version " + newtVersion)
+		logger.Info("Newt version %s", newtVersion)
 	}
 
 	if err := updates.CheckForUpdate("fosrl", "newt", newtVersion); err != nil {
@@ -362,6 +493,8 @@ func main() {
 	}
 	endpoint = client.GetConfig().Endpoint // Update endpoint from config
 	id = client.GetConfig().ID             // Update ID from config
+	// Update site labels for metrics with the resolved ID
+	telemetry.UpdateSiteInfo(id, region)
 
 	// output env var values if set
 	logger.Debug("Endpoint: %v", endpoint)
@@ -403,6 +536,7 @@ func main() {
 	var pm *proxy.ProxyManager
 	var connected bool
 	var wgData WgData
+	var dockerEventMonitor *docker.EventMonitor
 
 	if acceptClients {
 		setupClients(client)
@@ -468,7 +602,11 @@ func main() {
 
 	// Register handlers for different message types
 	client.RegisterHandler("newt/wg/connect", func(msg websocket.WSMessage) {
-		logger.Info("Received registration message")
+		logger.Debug("Received registration message")
+		regResult := "success"
+		defer func() {
+			telemetry.IncSiteRegistration(ctx, regResult)
+		}()
 		if stopFunc != nil {
 			stopFunc()     // stop the ws from sending more requests
 			stopFunc = nil // reset stopFunc to nil to avoid double stopping
@@ -487,22 +625,25 @@ func main() {
 
 		jsonData, err := json.Marshal(msg.Data)
 		if err != nil {
-			logger.Info("Error marshaling data: %v", err)
+			logger.Info(fmtErrMarshaling, err)
+			regResult = "failure"
 			return
 		}
 
 		if err := json.Unmarshal(jsonData, &wgData); err != nil {
 			logger.Info("Error unmarshaling target data: %v", err)
+			regResult = "failure"
 			return
 		}
 
-		logger.Debug("Received: %+v", msg)
+		logger.Debug(fmtReceivedMsg, msg)
 		tun, tnet, err = netstack.CreateNetTUN(
 			[]netip.Addr{netip.MustParseAddr(wgData.TunnelIP)},
 			[]netip.Addr{netip.MustParseAddr(dns)},
 			mtuInt)
 		if err != nil {
 			logger.Error("Failed to create TUN device: %v", err)
+			regResult = "failure"
 		}
 
 		setDownstreamTNetstack(tnet)
@@ -516,6 +657,7 @@ func main() {
 		host, _, err := net.SplitHostPort(wgData.Endpoint)
 		if err != nil {
 			logger.Error("Failed to split endpoint: %v", err)
+			regResult = "failure"
 			return
 		}
 
@@ -524,6 +666,7 @@ func main() {
 		endpoint, err := resolveDomain(wgData.Endpoint)
 		if err != nil {
 			logger.Error("Failed to resolve endpoint: %v", err)
+			regResult = "failure"
 			return
 		}
 
@@ -539,12 +682,14 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		err = dev.IpcSet(config)
 		if err != nil {
 			logger.Error("Failed to configure WireGuard device: %v", err)
+			regResult = "failure"
 		}
 
 		// Bring up the device
 		err = dev.Up()
 		if err != nil {
 			logger.Error("Failed to bring up WireGuard device: %v", err)
+			regResult = "failure"
 		}
 
 		logger.Debug("WireGuard device created. Lets ping the server now...")
@@ -557,11 +702,15 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 		// Use reliable ping for initial connection test
 		logger.Debug("Testing initial connection with reliable ping...")
-		_, err = reliablePing(tnet, wgData.ServerIP, pingTimeout, 5)
+		lat, err := reliablePing(tnet, wgData.ServerIP, pingTimeout, 5)
+		if err == nil && wgData.PublicKey != "" {
+			telemetry.ObserveTunnelLatency(ctx, wgData.PublicKey, "wireguard", lat.Seconds())
+		}
 		if err != nil {
 			logger.Warn("Initial reliable ping failed, but continuing: %v", err)
+			regResult = "failure"
 		} else {
-			logger.Info("Initial connection test successful")
+			logger.Debug("Initial connection test successful")
 		}
 
 		pingWithRetryStopChan, _ = pingWithRetry(tnet, wgData.ServerIP, pingTimeout)
@@ -570,11 +719,14 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		// as the pings will continue in the background
 		if !connected {
 			logger.Debug("Starting ping check")
-			pingStopChan = startPingCheck(tnet, wgData.ServerIP, client)
+			pingStopChan = startPingCheck(tnet, wgData.ServerIP, client, wgData.PublicKey)
 		}
 
 		// Create proxy manager
 		pm = proxy.NewProxyManager(tnet)
+		pm.SetAsyncBytes(metricsAsyncBytes)
+		// Set tunnel_id for metrics (WireGuard peer public key)
+		pm.SetTunnelID(wgData.PublicKey)
 
 		connected = true
 
@@ -600,7 +752,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		if err := healthMonitor.AddTargets(wgData.HealthCheckTargets); err != nil {
 			logger.Error("Failed to bulk add health check targets: %v", err)
 		} else {
-			logger.Info("Successfully added %d health check targets", len(wgData.HealthCheckTargets))
+			logger.Debug("Successfully added %d health check targets", len(wgData.HealthCheckTargets))
 		}
 
 		err = pm.Start()
@@ -611,9 +763,18 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 
 	client.RegisterHandler("newt/wg/reconnect", func(msg websocket.WSMessage) {
 		logger.Info("Received reconnect message")
+		if wgData.PublicKey != "" {
+			telemetry.IncReconnect(ctx, wgData.PublicKey, "server", telemetry.ReasonServerRequest)
+		}
 
 		// Close the WireGuard device and TUN
 		closeWgTunnel()
+
+		// Clear metrics attrs and sessions for the tunnel
+		if pm != nil {
+			pm.ClearTunnelID()
+			state.Global().ClearTunnel(wgData.PublicKey)
+		}
 
 		// Mark as disconnected
 		connected = false
@@ -624,13 +785,18 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 
 		// Request exit nodes from the server
-		stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
+		stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{
+			"noCloud": noCloud,
+		}, 3*time.Second)
 
 		logger.Info("Tunnel destroyed, ready for reconnection")
 	})
 
 	client.RegisterHandler("newt/wg/terminate", func(msg websocket.WSMessage) {
 		logger.Info("Received termination message")
+		if wgData.PublicKey != "" {
+			telemetry.IncReconnect(ctx, wgData.PublicKey, "server", telemetry.ReasonServerRequest)
+		}
 
 		// Close the WireGuard device and TUN
 		closeWgTunnel()
@@ -647,7 +813,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	})
 
 	client.RegisterHandler("newt/ping/exitNodes", func(msg websocket.WSMessage) {
-		logger.Info("Received ping message")
+		logger.Debug("Received ping message")
 		if stopFunc != nil {
 			stopFunc()     // stop the ws from sending more requests
 			stopFunc = nil // reset stopFunc to nil to avoid double stopping
@@ -658,7 +824,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 
 		jsonData, err := json.Marshal(msg.Data)
 		if err != nil {
-			logger.Info("Error marshaling data: %v", err)
+			logger.Info(fmtErrMarshaling, err)
 			return
 		}
 		if err := json.Unmarshal(jsonData, &exitNodeData); err != nil {
@@ -699,7 +865,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 				},
 			}
 
-			stopFunc = client.SendMessageInterval("newt/wg/register", map[string]interface{}{
+			stopFunc = client.SendMessageInterval(topicWGRegister, map[string]interface{}{
 				"publicKey":   publicKey.String(),
 				"pingResults": pingResults,
 				"newtVersion": newtVersion,
@@ -802,7 +968,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 
 		// Send the ping results to the cloud for selection
-		stopFunc = client.SendMessageInterval("newt/wg/register", map[string]interface{}{
+		stopFunc = client.SendMessageInterval(topicWGRegister, map[string]interface{}{
 			"publicKey":   publicKey.String(),
 			"pingResults": pingResults,
 			"newtVersion": newtVersion,
@@ -812,17 +978,17 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	})
 
 	client.RegisterHandler("newt/tcp/add", func(msg websocket.WSMessage) {
-		logger.Debug("Received: %+v", msg)
+		logger.Debug(fmtReceivedMsg, msg)
 
 		// if there is no wgData or pm, we can't add targets
 		if wgData.TunnelIP == "" || pm == nil {
-			logger.Info("No tunnel IP or proxy manager available")
+			logger.Info(msgNoTunnelOrProxy)
 			return
 		}
 
 		targetData, err := parseTargetData(msg.Data)
 		if err != nil {
-			logger.Info("Error parsing target data: %v", err)
+			logger.Info(fmtErrParsingTargetData, err)
 			return
 		}
 
@@ -837,17 +1003,17 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	})
 
 	client.RegisterHandler("newt/udp/add", func(msg websocket.WSMessage) {
-		logger.Info("Received: %+v", msg)
+		logger.Info(fmtReceivedMsg, msg)
 
 		// if there is no wgData or pm, we can't add targets
 		if wgData.TunnelIP == "" || pm == nil {
-			logger.Info("No tunnel IP or proxy manager available")
+			logger.Info(msgNoTunnelOrProxy)
 			return
 		}
 
 		targetData, err := parseTargetData(msg.Data)
 		if err != nil {
-			logger.Info("Error parsing target data: %v", err)
+			logger.Info(fmtErrParsingTargetData, err)
 			return
 		}
 
@@ -862,17 +1028,17 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	})
 
 	client.RegisterHandler("newt/udp/remove", func(msg websocket.WSMessage) {
-		logger.Info("Received: %+v", msg)
+		logger.Info(fmtReceivedMsg, msg)
 
 		// if there is no wgData or pm, we can't add targets
 		if wgData.TunnelIP == "" || pm == nil {
-			logger.Info("No tunnel IP or proxy manager available")
+			logger.Info(msgNoTunnelOrProxy)
 			return
 		}
 
 		targetData, err := parseTargetData(msg.Data)
 		if err != nil {
-			logger.Info("Error parsing target data: %v", err)
+			logger.Info(fmtErrParsingTargetData, err)
 			return
 		}
 
@@ -887,17 +1053,17 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	})
 
 	client.RegisterHandler("newt/tcp/remove", func(msg websocket.WSMessage) {
-		logger.Info("Received: %+v", msg)
+		logger.Info(fmtReceivedMsg, msg)
 
 		// if there is no wgData or pm, we can't add targets
 		if wgData.TunnelIP == "" || pm == nil {
-			logger.Info("No tunnel IP or proxy manager available")
+			logger.Info(msgNoTunnelOrProxy)
 			return
 		}
 
 		targetData, err := parseTargetData(msg.Data)
 		if err != nil {
-			logger.Info("Error parsing target data: %v", err)
+			logger.Info(fmtErrParsingTargetData, err)
 			return
 		}
 
@@ -938,7 +1104,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		if err != nil {
 			logger.Error("Failed to send Docker socket check response: %v", err)
 		} else {
-			logger.Info("Docker socket check response sent: available=%t", isAvailable)
+			logger.Debug("Docker socket check response sent: available=%t", isAvailable)
 		}
 	})
 
@@ -969,7 +1135,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		if err != nil {
 			logger.Error("Failed to send Docker container list: %v", err)
 		} else {
-			logger.Info("Docker container list sent, count: %d", len(containers))
+			logger.Debug("Docker container list sent, count: %d", len(containers))
 		}
 	})
 
@@ -981,7 +1147,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 
 		jsonData, err := json.Marshal(msg.Data)
 		if err != nil {
-			logger.Info("Error marshaling data: %v", err)
+			logger.Info(fmtErrMarshaling, err)
 			return
 		}
 		if err := json.Unmarshal(jsonData, &sshPublicKeyData); err != nil {
@@ -1085,7 +1251,7 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		if err := healthMonitor.AddTargets(config.Targets); err != nil {
 			logger.Error("Failed to add health check targets: %v", err)
 		} else {
-			logger.Info("Added %d health check targets", len(config.Targets))
+			logger.Debug("Added %d health check targets", len(config.Targets))
 		}
 
 		logger.Debug("Health check targets added: %+v", config.Targets)
@@ -1138,9 +1304,9 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 
 		if err := healthMonitor.EnableTarget(requestData.ID); err != nil {
-			logger.Error("Failed to enable health check target %s: %v", requestData.ID, err)
+			logger.Error("Failed to enable health check target %d: %v", requestData.ID, err)
 		} else {
-			logger.Info("Enabled health check target: %s", requestData.ID)
+			logger.Info("Enabled health check target: %d", requestData.ID)
 		}
 	})
 
@@ -1163,9 +1329,9 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 
 		if err := healthMonitor.DisableTarget(requestData.ID); err != nil {
-			logger.Error("Failed to disable health check target %s: %v", requestData.ID, err)
+			logger.Error("Failed to disable health check target %d: %v", requestData.ID, err)
 		} else {
-			logger.Info("Disabled health check target: %s", requestData.ID)
+			logger.Info("Disabled health check target: %d", requestData.ID)
 		}
 	})
 
@@ -1193,6 +1359,29 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 		}
 	})
 
+	// Register handler for getting health check status
+	client.RegisterHandler("newt/blueprint/results", func(msg websocket.WSMessage) {
+		logger.Debug("Received blueprint results message")
+
+		var blueprintResult BlueprintResult
+
+		jsonData, err := json.Marshal(msg.Data)
+		if err != nil {
+			logger.Info("Error marshaling data: %v", err)
+			return
+		}
+		if err := json.Unmarshal(jsonData, &blueprintResult); err != nil {
+			logger.Info("Error unmarshaling config results data: %v", err)
+			return
+		}
+
+		if blueprintResult.Success {
+			logger.Debug("Blueprint applied successfully!")
+		} else {
+			logger.Warn("Blueprint application failed: %s", blueprintResult.Message)
+		}
+	})
+
 	client.OnConnect(func() error {
 		publicKey = privateKey.PublicKey()
 		logger.Debug("Public key: %s", publicKey)
@@ -1203,18 +1392,22 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 			if stopFunc != nil {
 				stopFunc()
 			}
-			// request from the server the list of nodes to ping at newt/ping/request
-			stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
-			logger.Info("Requesting exit nodes from server")
+			// request from the server the list of nodes to ping
+			stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{
+				"noCloud": noCloud,
+			}, 3*time.Second)
+			logger.Debug("Requesting exit nodes from server")
 			clientsOnConnect()
 		}
 
 		// Send registration message to the server for backward compatibility
-		err := client.SendMessage("newt/wg/register", map[string]interface{}{
+		err := client.SendMessage(topicWGRegister, map[string]interface{}{
 			"publicKey":           publicKey.String(),
 			"newtVersion":         newtVersion,
 			"backwardsCompatible": true,
 		})
+
+		sendBlueprint(client)
 
 		if err != nil {
 			logger.Error("Failed to send registration message: %v", err)
@@ -1230,6 +1423,34 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 	}
 	defer client.Close()
 
+	// Initialize Docker event monitoring if Docker socket is available and monitoring is enabled
+	if dockerSocket != "" {
+		logger.Debug("Initializing Docker event monitoring")
+		dockerEventMonitor, err = docker.NewEventMonitor(dockerSocket, dockerEnforceNetworkValidationBool, func(containers []docker.Container) {
+			// Send updated container list via websocket when Docker events occur
+			logger.Debug("Docker event detected, sending updated container list (%d containers)", len(containers))
+			err := client.SendMessage("newt/socket/containers", map[string]interface{}{
+				"containers": containers,
+			})
+			if err != nil {
+				logger.Error("Failed to send updated container list after Docker event: %v", err)
+			} else {
+				logger.Debug("Updated container list sent successfully")
+			}
+		})
+
+		if err != nil {
+			logger.Error("Failed to create Docker event monitor: %v", err)
+		} else {
+			err = dockerEventMonitor.Start()
+			if err != nil {
+				logger.Error("Failed to start Docker event monitoring: %v", err)
+			} else {
+				logger.Debug("Docker event monitoring started successfully")
+			}
+		}
+	}
+
 	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1237,6 +1458,10 @@ persistent_keepalive_interval=5`, fixKey(privateKey.String()), fixKey(wgData.Pub
 
 	// Close clients first (including WGTester)
 	closeClients()
+
+	if dockerEventMonitor != nil {
+		dockerEventMonitor.Stop()
+	}
 
 	if healthMonitor != nil {
 		healthMonitor.Stop()

@@ -15,6 +15,7 @@ import (
 
 	"math/rand"
 
+	"github.com/fosrl/newt/internal/telemetry"
 	"github.com/fosrl/newt/logger"
 	"github.com/fosrl/newt/proxy"
 	"github.com/fosrl/newt/websocket"
@@ -22,7 +23,10 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+	"gopkg.in/yaml.v3"
 )
+
+const msgHealthFileWriteFailed = "Failed to write health file: %v"
 
 func fixKey(key string) string {
 	// Remove any whitespace
@@ -252,7 +256,7 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 		if healthFile != "" {
 			err := os.WriteFile(healthFile, []byte("ok"), 0644)
 			if err != nil {
-				logger.Warn("Failed to write health file: %v", err)
+				logger.Warn(msgHealthFileWriteFailed, err)
 			}
 		}
 		return stopChan, nil
@@ -331,11 +335,13 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 					if healthFile != "" {
 						err := os.WriteFile(healthFile, []byte("ok"), 0644)
 						if err != nil {
-							logger.Warn("Failed to write health file: %v", err)
+							logger.Warn(msgHealthFileWriteFailed, err)
 						}
 					}
-					return
 				}
+			case <-pingStopChan:
+				// Stop the goroutine when signaled
+				return
 			}
 		}
 	}()
@@ -344,7 +350,7 @@ func pingWithRetry(tnet *netstack.Net, dst string, timeout time.Duration) (stopC
 	return stopChan, fmt.Errorf("initial ping attempts failed, continuing in background")
 }
 
-func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Client) chan struct{} {
+func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Client, tunnelID string) chan struct{} {
 	maxInterval := 6 * time.Second
 	currentInterval := pingInterval
 	consecutiveFailures := 0
@@ -484,6 +490,9 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 						if !connectionLost {
 							connectionLost = true
 							logger.Warn("Connection to server lost after %d failures. Continuous reconnection attempts will be made.", consecutiveFailures)
+							if tunnelID != "" {
+								telemetry.IncReconnect(context.Background(), tunnelID, "client", telemetry.ReasonTimeout)
+							}
 							stopFunc = client.SendMessageInterval("newt/ping/request", map[string]interface{}{}, 3*time.Second)
 							// Send registration message to the server for backward compatibility
 							err := client.SendMessage("newt/wg/register", map[string]interface{}{
@@ -510,6 +519,10 @@ func startPingCheck(tnet *netstack.Net, serverIP string, client *websocket.Clien
 				} else {
 					// Track recent latencies
 					recentLatencies = append(recentLatencies, latency)
+					// Record tunnel latency (limit sampling to this periodic check)
+					if tunnelID != "" {
+						telemetry.ObserveTunnelLatency(context.Background(), tunnelID, "wireguard", latency.Seconds())
+					}
 					if len(recentLatencies) > 10 {
 						recentLatencies = recentLatencies[1:]
 					}
@@ -668,7 +681,8 @@ func updateTargets(pm *proxy.ProxyManager, action string, tunnelIP string, proto
 			continue
 		}
 
-		if action == "add" {
+		switch action {
+		case "add":
 			target := parts[1] + ":" + parts[2]
 
 			// Call updown script if provided
@@ -694,7 +708,7 @@ func updateTargets(pm *proxy.ProxyManager, action string, tunnelIP string, proto
 			// Add the new target
 			pm.AddTarget(proto, tunnelIP, port, processedTarget)
 
-		} else if action == "remove" {
+		case "remove":
 			logger.Info("Removing target with port %d", port)
 
 			target := parts[1] + ":" + parts[2]
@@ -712,6 +726,8 @@ func updateTargets(pm *proxy.ProxyManager, action string, tunnelIP string, proto
 				logger.Error("Failed to remove target: %v", err)
 				return err
 			}
+		default:
+			logger.Info("Unknown action: %s", action)
 		}
 	}
 
@@ -758,4 +774,48 @@ func executeUpdownScript(action, proto, target string) (string, error) {
 	}
 
 	return target, nil
+}
+
+func sendBlueprint(client *websocket.Client) error {
+	if blueprintFile == "" {
+		return nil
+	}
+	// try to read the blueprint file
+	blueprintData, err := os.ReadFile(blueprintFile)
+	if err != nil {
+		logger.Error("Failed to read blueprint file: %v", err)
+	} else {
+		// first we should convert the yaml to json and error if the yaml is bad
+		var yamlObj interface{}
+		var blueprintJsonData string
+
+		err = yaml.Unmarshal(blueprintData, &yamlObj)
+		if err != nil {
+			logger.Error("Failed to parse blueprint YAML: %v", err)
+		} else {
+			// convert to json
+			jsonBytes, err := json.Marshal(yamlObj)
+			if err != nil {
+				logger.Error("Failed to convert blueprint to JSON: %v", err)
+			} else {
+				blueprintJsonData = string(jsonBytes)
+				logger.Debug("Converted blueprint to JSON: %s", blueprintJsonData)
+			}
+		}
+
+		// if we have valid json data, we can send it to the server
+		if blueprintJsonData == "" {
+			logger.Error("No valid blueprint JSON data to send to server")
+			return nil
+		}
+
+		logger.Info("Sending blueprint to server for application")
+
+		// send the blueprint data to the server
+		err = client.SendMessage("newt/blueprint/apply", map[string]interface{}{
+			"blueprint": blueprintJsonData,
+		})
+	}
+
+	return nil
 }

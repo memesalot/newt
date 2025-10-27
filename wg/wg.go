@@ -3,6 +3,7 @@
 package wg
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,16 +14,19 @@ import (
 	"sync"
 	"time"
 
+	"math/rand"
+
 	"github.com/fosrl/newt/logger"
 	"github.com/fosrl/newt/network"
 	"github.com/fosrl/newt/websocket"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
-	"golang.org/x/exp/rand"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/fosrl/newt/internal/telemetry"
 )
 
 type WgConfig struct {
@@ -106,7 +110,7 @@ func FindAvailableUDPPort(minPort, maxPort uint16) (uint16, error) {
 	}
 
 	// Fisher-Yates shuffle to randomize the port order
-	rand.Seed(uint64(time.Now().UnixNano()))
+	rand.Seed(time.Now().UnixNano())
 	for i := len(portRange) - 1; i > 0; i-- {
 		j := rand.Intn(i + 1)
 		portRange[i], portRange[j] = portRange[j], portRange[i]
@@ -152,6 +156,7 @@ func NewWireGuardService(interfaceName string, mtu int, generateAndSaveKeyTo str
 	}
 
 	var key wgtypes.Key
+	var port uint16
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
 	key, err = wgtypes.GeneratePrivateKey()
 	if err != nil {
@@ -177,38 +182,41 @@ func NewWireGuardService(interfaceName string, mtu int, generateAndSaveKeyTo str
 		}
 	}
 
-	service := &WireGuardService{
-		interfaceName: interfaceName,
-		mtu:           mtu,
-		client:        wsClient,
-		wgClient:      wgClient,
-		key:           key,
-		keyFilePath:   generateAndSaveKeyTo,
-		newtId:        newtId,
-		host:          host,
-		lastReadings:  make(map[string]PeerReading),
-		stopHolepunch: make(chan struct{}),
-	}
-
-	// Get the existing wireguard port (keep this part)
-	device, err := service.wgClient.Device(service.interfaceName)
+	// Get the existing wireguard port
+	device, err := wgClient.Device(interfaceName)
 	if err == nil {
-		service.Port = uint16(device.ListenPort)
-		if service.Port != 0 {
-			logger.Info("WireGuard interface %s already exists with port %d\n", service.interfaceName, service.Port)
+		port = uint16(device.ListenPort)
+		// also set the private key to the existing key
+		key = device.PrivateKey
+		if port != 0 {
+			logger.Info("WireGuard interface %s already exists with port %d\n", interfaceName, port)
 		} else {
-			service.Port, err = FindAvailableUDPPort(49152, 65535)
+			port, err = FindAvailableUDPPort(49152, 65535)
 			if err != nil {
 				fmt.Printf("Error finding available port: %v\n", err)
 				return nil, err
 			}
 		}
 	} else {
-		service.Port, err = FindAvailableUDPPort(49152, 65535)
+		port, err = FindAvailableUDPPort(49152, 65535)
 		if err != nil {
 			fmt.Printf("Error finding available port: %v\n", err)
 			return nil, err
 		}
+	}
+
+	service := &WireGuardService{
+		interfaceName: interfaceName,
+		mtu:           mtu,
+		client:        wsClient,
+		wgClient:      wgClient,
+		key:           key,
+		Port:          port,
+		keyFilePath:   generateAndSaveKeyTo,
+		newtId:        newtId,
+		host:          host,
+		lastReadings:  make(map[string]PeerReading),
+		stopHolepunch: make(chan struct{}),
 	}
 
 	// Register websocket handlers
@@ -276,6 +284,15 @@ func (s *WireGuardService) LoadRemoteConfig() error {
 }
 
 func (s *WireGuardService) handleConfig(msg websocket.WSMessage) {
+	ctx := context.Background()
+	if s.client != nil {
+		ctx = s.client.MetricsContext()
+	}
+	result := "success"
+	defer func() {
+		telemetry.IncConfigReload(ctx, result)
+	}()
+
 	var config WgConfig
 
 	logger.Debug("Received message: %v", msg)
@@ -284,11 +301,13 @@ func (s *WireGuardService) handleConfig(msg websocket.WSMessage) {
 	jsonData, err := json.Marshal(msg.Data)
 	if err != nil {
 		logger.Info("Error marshaling data: %v", err)
+		result = "failure"
 		return
 	}
 
 	if err := json.Unmarshal(jsonData, &config); err != nil {
 		logger.Info("Error unmarshaling target data: %v", err)
+		result = "failure"
 		return
 	}
 	s.config = config
@@ -298,13 +317,29 @@ func (s *WireGuardService) handleConfig(msg websocket.WSMessage) {
 		s.stopGetConfig = nil
 	}
 
-	// Ensure the WireGuard interface and peers are configured
-	if err := s.ensureWireguardInterface(config); err != nil {
-		logger.Error("Failed to ensure WireGuard interface: %v", err)
+	// telemetry: config reload success
+	// Optional reconnect reason mapping: config change
+	if s.serverPubKey != "" {
+		telemetry.IncReconnect(ctx, s.serverPubKey, "client", telemetry.ReasonConfigChange)
 	}
 
+	// Ensure the WireGuard interface and peers are configured
+	start := time.Now()
+	if err := s.ensureWireguardInterface(config); err != nil {
+		logger.Error("Failed to ensure WireGuard interface: %v", err)
+		telemetry.ObserveConfigApply(ctx, "interface", "failure", time.Since(start).Seconds())
+		result = "failure"
+	} else {
+		telemetry.ObserveConfigApply(ctx, "interface", "success", time.Since(start).Seconds())
+	}
+
+	startPeers := time.Now()
 	if err := s.ensureWireguardPeers(config.Peers); err != nil {
 		logger.Error("Failed to ensure WireGuard peers: %v", err)
+		telemetry.ObserveConfigApply(ctx, "peer", "failure", time.Since(startPeers).Seconds())
+		result = "failure"
+	} else {
+		telemetry.ObserveConfigApply(ctx, "peer", "success", time.Since(startPeers).Seconds())
 	}
 }
 
@@ -948,22 +983,30 @@ func (s *WireGuardService) encryptPayload(payload []byte) (interface{}, error) {
 }
 
 func (s *WireGuardService) keepSendingUDPHolePunch(host string) {
+	logger.Info("Starting UDP hole punch routine to %s:21820", host)
+
 	// send initial hole punch
 	if err := s.sendUDPHolePunch(host + ":21820"); err != nil {
-		logger.Error("Failed to send initial UDP hole punch: %v", err)
+		logger.Debug("Failed to send initial UDP hole punch: %v", err)
 	}
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+
+	timeout := time.NewTimer(15 * time.Second)
+	defer timeout.Stop()
 
 	for {
 		select {
 		case <-s.stopHolepunch:
 			logger.Info("Stopping UDP holepunch")
 			return
+		case <-timeout.C:
+			logger.Info("UDP holepunch routine timed out after 15 seconds")
+			return
 		case <-ticker.C:
 			if err := s.sendUDPHolePunch(host + ":21820"); err != nil {
-				logger.Error("Failed to send UDP hole punch: %v", err)
+				logger.Debug("Failed to send UDP hole punch: %v", err)
 			}
 		}
 	}
